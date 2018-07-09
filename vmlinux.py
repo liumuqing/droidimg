@@ -22,7 +22,9 @@ radare2 = True if 'R2PIPE_IN' in os.environ else False
 #////////////////////////////////////////////////////////////////////////////////////////////
 
 kallsyms = {
-            'arch'          :0,
+            'bits'          :0,
+            'arch'          :"arm",
+            'is_big_endian' : False, #FIXME: we need to guess this value at very beginning
             '_start'        :0,
             'numsyms'        :0,
             'address'       :[],
@@ -35,8 +37,9 @@ kallsyms = {
             'table_index_table' : 0,
             }
 
+#TODO: guess little/big endian first
 def INT(offset, vmlinux):
-    bytes = kallsyms['arch'] / 8
+    bytes = kallsyms['bits'] / 8
     s = vmlinux[offset:offset+bytes]
     f = 'I' if bytes==4 else 'Q'
     (num,) = struct.unpack(f, s)
@@ -87,7 +90,7 @@ def do_marker_table(kallsyms, offset, vmlinux):
     kallsyms['marker_table'] = offset   
     print '[+]kallsyms_marker_table = ', hex(offset)
 
-    offset += (((kallsyms['numsyms']-1)>>8)+1)*(kallsyms['arch']/8)
+    offset += (((kallsyms['numsyms']-1)>>8)+1)*(kallsyms['bits']/8)
     offset = STRIPZERO(offset, vmlinux)
 
     do_token_table(kallsyms, offset, vmlinux)
@@ -104,14 +107,14 @@ def do_type_table(kallsyms, offset, vmlinux):
         kallsyms['type_table'] = offset
 
         while INT(offset, vmlinux):
-            offset += (kallsyms['arch']/8)
+            offset += (kallsyms['bits']/8)
         offset = STRIPZERO(offset, vmlinux)
     else:
         kallsyms['type_table'] = 0
     
     print '[+]kallsyms_type_table = ', hex(kallsyms['type_table'])
 
-    offset -= (kallsyms['arch']/8)
+    offset -= (kallsyms['bits']/8)
     do_marker_table(kallsyms, offset, vmlinux)
             
 def do_name_table(kallsyms, offset, vmlinux):
@@ -157,15 +160,36 @@ def do_name_table(kallsyms, offset, vmlinux):
             kallsyms['type'].append(name[0])
             kallsyms['name'].append(name[1:])
 
+def do_guess_arch(kallsyms, vmlinux):
+    """guess arch by symbol name"""
+    arm_count = 0 
+    mips_count = 0
+    x86_count = 0
+    for i in xrange(kallsyms['numsyms']):
+        if kallsyms['name'][i].startswith("arm"):
+            arm_count += 1
+        if kallsyms['name'][i].startswith("mips"):
+            mips_count += 1
+        if kallsyms['name'][i].startswith("x86_"):
+            x86_count += 1
+    if arm_count == max(arm_count, mips_count, x86_count):
+        kallsyms["arch"] = "arm"
+    if mips_count == max(arm_count, mips_count, x86_count):
+        kallsyms["arch"] = "mips"
+    if x86_count == max(arm_count, mips_count, x86_count):
+        kallsyms["arch"] = "x86"
+
+
 def do_guess_start_address(kallsyms, vmlinux): 
-    _startaddr_from_xstext = 0
-    _startaddr_from_banner = 0
-    _startaddr_from_processor = 0
+    _startaddr_from_xstext = None
+    _startaddr_from_banner = None
+    _startaddr_from_processor = None
+    _startaddr_from_prologue = None
     
     for i in xrange(kallsyms['numsyms']):
         if kallsyms['name'][i] in ['_text', 'stext', '_stext', '_sinittext', '__init_begin']:
             if hex(kallsyms['address'][i]):
-                if _startaddr_from_xstext==0 or kallsyms['address'][i]<_startaddr_from_xstext:
+                if _startaddr_from_xstext is None or kallsyms['address'][i]<_startaddr_from_xstext:
                     _startaddr_from_xstext = kallsyms['address'][i]
         
         elif kallsyms['name'][i] == 'linux_banner':
@@ -177,9 +201,11 @@ def do_guess_start_address(kallsyms, vmlinux):
         elif kallsyms['name'][i] == '__lookup_processor_type_data':
             lookup_processor_addr = kallsyms['address'][i]
 
-            step = kallsyms['arch'] / 8
-            if kallsyms['arch'] == 32:
+            step = kallsyms['bits'] / 8
+            if kallsyms['bits'] == 32 and kallsyms["arch"] == "arm":
                 addr_base = 0xC0008000
+            elif kallsyms['bits'] == 32:
+                addr_base = 0x80008000 # TODO: I'n not sure how it looks like in mips and x86, I see a case that mips kernel starts from 0x8000?????
             else:
                 addr_base = 0xffffff8008080000
         
@@ -194,16 +220,62 @@ def do_guess_start_address(kallsyms, vmlinux):
             if _startaddr_from_processor == _startaddr_from_processor+0x100000:
                 _startaddr_from_processor = 0
 
-    start_addrs = [_startaddr_from_banner, _startaddr_from_processor, _startaddr_from_xstext]
-    if kallsyms['arch']==64 and _startaddr_from_banner!=_startaddr_from_xstext:
+    if _startaddr_from_banner is None:#this trick takes a longer time...
+        print "[!] be patient.. we need more time to find base address..."
+        if kallsyms["arch"] == "mips" and kallsyms["bits"] == 32 and kallsyms["is_big_endian"]:
+            prologue = "27 bd ff ??"#mipsel addui sp, sp, -xxxxx
+        elif kallsyms["arch"] == "mips" and kallsyms["bits"] == 32 and not kallsyms["is_big_endian"]:
+            prologue = "?? ff bd 27"#mips   sub sp, sp, xxxxx
+        elif kallsyms["arch"] == "arm" and kallsyms["bits"] == 32 and not kallsyms["is_big_endian"]:
+            prologue = "0d c0 a0 e1 ?? ?? 2d e9"#mov r12, sp; stm sp!, {xxx, xxx, xxx, xxx}
+        elif kallsyms["arch"] == "x86" and kallsyms["bits"] == 64 and not kallsyms["is_big_endian"]:
+            prologue = "55 48 89 d5"#push rbp; mov rbp, rsp; #FIXME: not tested
+        elif kallsyms["arch"] == "x86" and kallsyms["bits"] == 32 and not kallsyms["is_big_endian"]:
+            prologue = "55 89 e5"#push ebp; mov ebp, esp; #FIXME: not tested
+        if prologue is not None:
+            import random 
+            prologue = prologue.replace(" ", "")
+            l = len(prologue)/2
+            prologue_offset = []
+            offset = 0
+
+            #fina all offset that match prologue
+            while offset < len(vmlinux) - l:
+                hexx = vmlinux[offset:offset+l].encode("hex")
+                if all(map(lambda t:t[0] == "?" or t[0] == t[1], zip(prologue, hexx))):
+                    prologue_offset.append(offset)
+                offset += 1
+
+            base_vote = {}
+            #random.shuffle(prologue_offset)
+            prologue_offset = prologue_offset[:500:5]# we chose 100 prolog, for performance
+            for i in xrange(kallsyms['numsyms']):
+                addr = kallsyms['address'][i]
+                for offset in prologue_offset:
+                    base = addr - offset
+                    if base < 0:
+                        break
+                    if base_vote.get(base) is None:
+                        base_vote[base] = 0
+                    base_vote[base] += 1
+             
+            best = 0
+            for addr, count in base_vote.items():
+                if count > best:
+                    _startaddr_from_prologue = addr
+                    best = count
+    start_addrs = [_startaddr_from_banner, _startaddr_from_prologue, _startaddr_from_processor, _startaddr_from_xstext]
+    if kallsyms['bits']==64 and _startaddr_from_banner!=_startaddr_from_xstext:
          start_addrs.append( 0xffffff8008000000 + INT(8, vmlinux) )
 
-    # print '[+]kallsyms_guess_start_addresses = ',  hex(0xffffff8008000000 + INT(8, vmlinux)) if kallsyms['arch']==64 else '', hex(_startaddr_from_banner), hex(_startaddr_from_processor), hex(_startaddr_from_xstext)
-    
+    # print '[+]kallsyms_guess_start_addresses = ',  hex(0xffffff8008000000 + INT(8, vmlinux)) if kallsyms['bits']==64 else '', hex(_startaddr_from_banner), hex(_startaddr_from_processor), hex(_startaddr_from_xstext)
+
     for addr in start_addrs:
-        if addr % 0x1000 == 0:
-            kallsyms['_start']= addr
-            break
+        if addr is None:
+            continue
+        #if addr % 0x1000 == 0: #some vmlinux do not align to 0x1000....
+        kallsyms['_start']= addr
+        break
     else:
         assert False,"  [!]kernel start address error..."
 
@@ -248,11 +320,10 @@ def do_offset_table(kallsyms, start, vmlinux):
 
     return 0
 
-
 def do_address_table(kallsyms, offset, vmlinux):
-    step = kallsyms['arch'] / 8
-    if kallsyms['arch'] == 32:
-        addr_base = 0xC0000000
+    step = kallsyms['bits'] / 8
+    if kallsyms['bits'] == 32:
+        addr_base = 0x80000000
     else:
         addr_base = 0xffffff8008000000
 
@@ -305,7 +376,7 @@ def do_kallsyms(kallsyms, vmlinux):
     if kallsyms['numsyms'] == 0:
         print '[!]lookup_address_table error...'
         return
-
+ 
     print '[+]numsyms: ', kallsyms['numsyms']
 
     kallsyms['address_table'] = offset  
@@ -336,11 +407,12 @@ def do_kallsyms(kallsyms, vmlinux):
 
     offset = STRIPZERO(offset, vmlinux)
     do_name_table(kallsyms, offset, vmlinux)
+    do_guess_arch(kallsyms, vmlinux)
     do_guess_start_address(kallsyms, vmlinux)
     print '[+]kallsyms_start_address = ', hex(kallsyms['_start'])
     return
 
-def do_get_arch(kallsyms, vmlinux):
+def do_get_bits(kallsyms, vmlinux):
     def fuzzy_arm64(vmlinux):
         step = 8
         offset = 0
@@ -357,13 +429,13 @@ def do_get_arch(kallsyms, vmlinux):
         return False
 
     if re.search('ARMd', vmlinux[:0x200]):
-        kallsyms['arch'] = 64
+        kallsyms['bits'] = 64
     elif fuzzy_arm64(vmlinux):
-        kallsyms['arch'] = 64
+        kallsyms['bits'] = 64
     else:
-        kallsyms['arch'] = 32
+        kallsyms['bits'] = 32
 
-    print '[+]kallsyms_arch = ', kallsyms['arch']
+    print '[+]kallsyms_bits = ', kallsyms['bits']
 
 def print_kallsyms(kallsyms, vmlinux):
     buf = '\n'.join( '%x %c %s'%(kallsyms['address'][i],kallsyms['type'][i],kallsyms['name'][i]) for i in xrange(kallsyms['numsyms']) ) 
@@ -411,22 +483,25 @@ def load_file(li, neflags, format):
     li.seek(0)
     vmlinux = li.read(li.size())
 
-    do_get_arch(kallsyms, vmlinux)
+    do_get_bits(kallsyms, vmlinux)
     do_kallsyms(kallsyms, vmlinux)
     # print_kallsyms(kallsyms, vmlinux)
-    
-    if kallsyms['numsyms'] == 0:
-        print '[!]get kallsyms error...'
-        return 0
-    
-    idaapi.set_processor_type("arm", idaapi.SETPROC_ALL|idaapi.SETPROC_FATAL)
-    if kallsyms['arch'] == 64:
+    if kallsyms['arch'] == 'arm':
+        idaapi.set_processor_type('arm', idaapi.SETPROC_ALL|idaapi.SETPROC_FATAL)
+    elif kallsyms['arch'] == 'mips' and not kallsyms['is_big_endian']:
+        idaapi.set_processor_type('mipsl', idaapi.SETPROC_ALL|idaapi.SETPROC_FATAL)
+    elif kallsyms['arch'] == 'mips' and not kallsyms['is_big_endian']:
+        idaapi.set_processor_type('mipsb', idaapi.SETPROC_ALL|idaapi.SETPROC_FATAL)
+    elif kallsyms['arch'] == 'x86':
+        idaapi.set_processor_type('metapc', idaapi.SETPROC_ALL|idaapi.SETPROC_FATAL)#NOT tested
+
+    if kallsyms['bits'] == 64:
         idaapi.get_inf_structure().lflags |= idaapi.LFLG_64BIT
 
     li.file2base(0, kallsyms['_start'], kallsyms['_start']+li.size(), True)
 
     s = idaapi.segment_t()
-    s.bitness = kallsyms['arch'] / 32
+    s.bitness = kallsyms['bits'] / 32
     s.startEA = kallsyms['_start']
     s.endEA = kallsyms['_start']+li.size()
     idaapi.add_segm_ex(s,".text","CODE",idaapi.ADDSEG_OR_DIE)
@@ -449,7 +524,7 @@ def r2():
     with open(info["core"]["file"], 'rb') as f:
             vmlinux = f.read()
 
-    do_get_arch(kallsyms, vmlinux)
+    do_get_bits(kallsyms, vmlinux)
     do_kallsyms(kallsyms, vmlinux)
     # print_kallsyms(kallsyms, vmlinux)
 
@@ -458,7 +533,7 @@ def r2():
         return 0
 
     r2p.cmd("e asm.arch = arm")
-    r2p.cmd("e asm.bits = %d" % kallsyms['arch'])
+    r2p.cmd("e asm.bits = %d" % kallsyms['bits'])
 
     siol_map = r2p.cmdj("omj")[0]["map"]
     set_baddr = "omr " + str(siol_map) + " " + str(kallsyms["_start"])
@@ -496,7 +571,7 @@ def main(argv):
 
     if os.path.exists(argv[1]):
         vmlinux = open(argv[1],'rb').read()
-        do_get_arch(kallsyms, vmlinux)
+        do_get_bits(kallsyms, vmlinux)
         do_kallsyms(kallsyms, vmlinux)
         if kallsyms['numsyms'] > 0:
             print_kallsyms(kallsyms, vmlinux)
