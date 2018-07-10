@@ -343,7 +343,7 @@ def do_address_table(kallsyms, offset, vmlinux):
 
 def do_kallsyms(kallsyms, vmlinux):
     step = kallsyms['arch'] / 8
-    min_numsyms = 30000
+    min_numsyms = 4000
 
     offset = 0
     vmlen  = len(vmlinux)
