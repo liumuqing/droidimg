@@ -342,7 +342,7 @@ def do_address_table(kallsyms, offset, vmlinux):
     return 0
 
 def do_kallsyms(kallsyms, vmlinux):
-    step = kallsyms['arch'] / 8
+    step = kallsyms['bits'] / 8
     min_numsyms = 4000
 
     offset = 0
@@ -370,7 +370,7 @@ def do_kallsyms(kallsyms, vmlinux):
                 break
             else:
                 offset += (num+1) * step
-        step = kallsyms['arch'] / 8 # recover normal step
+        step = kallsyms['bits'] / 8 # recover normal step
 
 
     if kallsyms['numsyms'] == 0:
