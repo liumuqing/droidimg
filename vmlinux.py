@@ -419,13 +419,13 @@ def do_get_bits(kallsyms, vmlinux):
         vmlen  = len(vmlinux) - len(vmlinux)%8
         addr_base = 0xffffff8008000000
         while offset+step < vmlen:
-          for i in xrange(offset, vmlen, step):
+            for i in xrange(offset, vmlen, step):
                 if INT64(i, vmlinux) < addr_base:
                     addrnum = (i-offset)/step
                     if addrnum > 10000:
                         return True
-                    else:
-                        offset = i+step
+                else:
+                    offset = i+step
         return False
 
     if re.search('ARMd', vmlinux[:0x200]):
